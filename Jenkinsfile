@@ -3,10 +3,11 @@ pipeline {
 
     options {
         disableConcurrentBuilds()
+        timestamps()
     }
 
     environment {
-        IMAGE = "mycompany/payment"
+        IMAGE = "YOUR_DOCKERHUB_USERNAME/payment"
         TAG = "${BUILD_NUMBER}"
     }
 
@@ -23,6 +24,8 @@ pipeline {
                         script: '@git branch --show-current',
                         returnStdout: true
                     ).trim()
+
+                    env.DOCKER_IMAGE = "${IMAGE}:${TAG}"
                 }
 
                 bat '''
@@ -30,33 +33,79 @@ pipeline {
                       --build-arg BUILD_NUMBER=%BUILD_NUMBER% ^
                       --build-arg GIT_COMMIT=%GIT_COMMIT% ^
                       --build-arg BRANCH_NAME=%BRANCH_NAME% ^
-                      -t %IMAGE%:%TAG% .
+                      -t %DOCKER_IMAGE% .
                 '''
             }
         }
 
         stage('Test') {
             steps {
-                bat 'docker run --rm %IMAGE%:%TAG% pytest -q'
+                bat 'docker run --rm %DOCKER_IMAGE% pytest -q'
             }
         }
 
         stage('Tag') {
             steps {
-                bat 'docker tag %IMAGE%:%TAG% %IMAGE%:%TAG%'
+                echo "Deployable immutable tag: ${DOCKER_IMAGE}"
+                bat 'docker image inspect %DOCKER_IMAGE%'
             }
         }
 
         stage('Push') {
             steps {
-                echo 'Configure registry login and push in the next step.'
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-creds',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_TOKEN'
+                    )
+                ]) {
+                    bat '''
+                        @echo off
+                        echo %DOCKER_TOKEN% | docker login -u %DOCKER_USER% --password-stdin
+                        if errorlevel 1 exit /b 1
+                        docker push %DOCKER_IMAGE%
+                        if errorlevel 1 exit /b 1
+                        docker logout
+                    '''
+                }
             }
         }
 
         stage('Deploy') {
             steps {
-                echo 'Deployment will be enabled after registry configuration.'
+                bat '''
+                    @echo off
+                    docker pull %DOCKER_IMAGE%
+                    if errorlevel 1 exit /b 1
+
+                    docker stop payment || exit /b 0
+                '''
+                bat '''
+                    @echo off
+                    docker rm payment 2>NUL
+                    docker run -d ^
+                      --name payment ^
+                      -p 8080:8080 ^
+                      -e APP_VERSION=%BUILD_NUMBER% ^
+                      -e BUILD_NUMBER=%BUILD_NUMBER% ^
+                      -e GIT_COMMIT=%GIT_COMMIT% ^
+                      -e BRANCH_NAME=%BRANCH_NAME% ^
+                      -e DOCKER_IMAGE=%DOCKER_IMAGE% ^
+                      %DOCKER_IMAGE%
+                    if errorlevel 1 exit /b 1
+                '''
+                bat 'curl --fail http://localhost:8080/version'
             }
+        }
+    }
+
+    post {
+        always {
+            echo "Jenkins build: ${BUILD_NUMBER}"
+            echo "Git commit: ${GIT_COMMIT}"
+            echo "Branch: ${BRANCH_NAME}"
+            echo "Docker image: ${IMAGE}:${TAG}"
         }
     }
 }
